@@ -95,6 +95,13 @@ input.ltr{direction:ltr;text-align:left}
 .stake-btn b{display:block;font-size:20px;font-weight:900}
 .stake-btn.active{border-color:var(--gold);color:var(--txt);box-shadow:0 0 18px rgba(255,209,102,.25)}
 .stake-btn.active b{color:var(--gold)}
+/* שולחנות פתוחים */
+.rlist{display:flex;flex-direction:column;gap:10px}
+.rcard{display:flex;align-items:center;gap:10px;padding:12px 16px;animation:seatIn .4s ease-out backwards}
+.rcard .rinfo{flex:1;min-width:0}
+.rcard .rhost{font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rcard .rmeta{color:var(--dim);font-size:12px;margin-top:2px}
+.rcard .rmeta .hi{color:var(--gold);font-weight:800}
 /* ---- חדר המתנה ---- */
 .room-head{text-align:center;padding:18px 0 6px}
 .room-head h2{font-size:22px;font-weight:800}
@@ -292,6 +299,8 @@ input.ltr{direction:ltr;text-align:left}
         <input id="inp-code" class="code" maxlength="4" placeholder="KODC">
         <button class="btn" id="btn-join">הצטרף</button>
       </div>
+      <div class="divider">🃏 שולחנות פתוחים</div>
+      <div id="rooms-list" class="rlist"><div class="hint" style="text-align:center">טוען שולחנות…</div></div>
       <div class="linkline" id="btn-logout">התנתקות</div>
     </div>
   </section>
@@ -315,6 +324,7 @@ input.ltr{direction:ltr;text-align:left}
   <!-- שולחן משחק -->
   <section id="scr-table" class="screen">
     <div class="glass topbar">
+      <button class="btn ghost small" id="btn-home-t" title="דף הבית">🏠</button>
       <div class="roundmeter">
         <span id="round-label">סיבוב 1</span>
         <span class="rseg" data-r="1"></span><span class="rseg" data-r="2"></span>
@@ -447,7 +457,43 @@ function showLobby() {
   if (!a) return show('scr-auth');
   $('greet-name').textContent = a.name;
   show('scr-lobby');
+  loadRooms();
 }
+function exitToLobby() {
+  S.pollSeq++; S.code = null; S.pid = null; S.state = null; S.v = -1;
+  clearSession();
+  showLobby();
+}
+async function leaveRoom() {
+  try { await api('/api/action', { code: S.code, pid: S.pid, type: 'leave' }); } catch (e) {}
+  exitToLobby();
+}
+/* שולחנות פתוחים בלובי */
+async function loadRooms() {
+  const a = auth();
+  const list = $('rooms-list');
+  if (!a || !$('scr-lobby').classList.contains('active')) return;
+  try {
+    const r = await api('/api/rooms', { session: a.token });
+    list.innerHTML = '';
+    if (!r.rooms.length) {
+      list.innerHTML = '<div class="hint" style="text-align:center">אין כרגע שולחנות פתוחים — פתח אחד למעלה!</div>';
+      return;
+    }
+    for (const room of r.rooms) {
+      const d = document.createElement('div');
+      d.className = 'glass rcard';
+      const stakeTxt = room.stake === 'high'
+        ? '<span class="hi">שולחן גבוה · 105</span>' : 'שולחן רגיל · 52.5';
+      d.innerHTML = `<div class="rinfo">
+        <div class="rhost">🃏 השולחן של ${esc(room.host)}</div>
+        <div class="rmeta">${stakeTxt} · ${room.count}/${room.seats} שחקנים${room.hasBots ? ' · אימון' : ''}</div></div>`;
+      d.appendChild(btn('הצטרף', 'small primary', () => joinRoom(room.code)));
+      list.appendChild(d);
+    }
+  } catch (e) { /* ננסה שוב ברענון הבא */ }
+}
+setInterval(loadRooms, 5000);
 
 /* טאבים */
 $('tab-login').onclick = () => setTab('login');
@@ -508,20 +554,27 @@ $('btn-create').onclick = async function () {
   }
   finally { this.disabled = false; }
 };
-$('btn-join').onclick = async function () {
-  if (this.disabled) return;
+async function joinRoom(code) {
   const a = auth();
   if (!a) return needLogin('צריך להתחבר');
-  const code = $('inp-code').value.trim().toUpperCase();
-  if (code.length !== 4) return toast('קוד חדר = 4 תווים', 1);
-  this.disabled = true;
   try {
     const r = await api('/api/join', { session: a.token, code });
     enterRoom(r.code, r.pid, r.name);
   } catch (e) {
     if (e.status === 401) needLogin(e.message); else toast(e.message, 1);
   }
-  finally { this.disabled = false; }
+}
+$('btn-join').onclick = async function () {
+  if (this.disabled) return;
+  const code = $('inp-code').value.trim().toUpperCase();
+  if (code.length !== 4) return toast('קוד חדר = 4 תווים', 1);
+  this.disabled = true;
+  try { await joinRoom(code); } finally { this.disabled = false; }
+};
+$('btn-home-t').onclick = () => {
+  const st = S.state;
+  if (!st || st.phase === 'waiting' || st.phase === 'over') return leaveRoom();
+  if (confirm('לצאת לדף הראשי? המשחק ימשיך לרוץ והיד שלך תמשיך לשחק עד הסוף.')) exitToLobby();
 };
 $('inp-code').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-join').click(); });
 function enterRoom(code, pid, name) {
@@ -574,7 +627,10 @@ function renderRoom(st) {
   S.shownRound = 0; S.flippedCount = 0; S.dealtRound = 0; S.lastPoints = {};
   $('room-code').textContent = st.code;
   const buyIn = st.entry + st.fee;
-  $('room-stake').textContent = `${stakeName(st)} · כניסה ${buyIn}`;
+  const anyBot = st.players.some(p => p.isBot);
+  $('room-stake').textContent = anyBot
+    ? `${stakeName(st)} · משחק אימון — בלי נקודות`
+    : `${stakeName(st)} · כניסה ${buyIn}`;
   $('rules').innerHTML =
     `<b>איך משחקים?</b> כל שחקן משלם <b>${buyIn} נקודות</b> כניסה — ${st.entry} לקופה (סה"כ ${st.entry * st.seats}) + ${st.fee} עמלת בית. ` +
     `כולם מקבלים 4 קלפים <b>גלויים</b>. נפתח בורד של 5 קלפים — היד הטובה לפי חוקי אומהה (בדיוק 2 מהיד + 3 מהבורד) לוקחת <b>${st.entry} נק'</b>. ` +
@@ -602,16 +658,18 @@ function renderRoom(st) {
   const act = $('room-actions');
   act.innerHTML = '';
   if (amHost(st)) {
-    const ready = st.players.length === st.seats && st.players.every(p => p.points >= buyIn);
-    act.appendChild(btn(`התחל משחק (כניסה ${buyIn})`, 'primary', () => action('start'), !ready));
+    const full = st.players.length === st.seats;
+    const ready = anyBot ? full : (full && st.players.every(p => p.points >= buyIn));
+    act.appendChild(btn(anyBot ? 'התחל משחק אימון' : `התחל משחק (כניסה ${buyIn})`, 'primary', () => action('start'), !ready));
     if (st.players.length < st.seats)
-      act.appendChild(btn('מלא בשחקני דמו', 'ghost', () => action('fillDemo')));
+      act.appendChild(btn('מלא בשחקני דמו (אימון)', 'ghost', () => action('fillDemo')));
   } else {
     const w = document.createElement('div');
     w.className = 'waitmsg';
     w.textContent = 'ממתינים שהמארח יתחיל את המשחק…';
     act.appendChild(w);
   }
+  act.appendChild(btn('🏠 עזוב חדר', 'ghost', leaveRoom));
 }
 
 function renderTable(st) {
@@ -622,7 +680,7 @@ function renderTable(st) {
     S.shownRound = 0; S.flippedCount = 0; S.dealtRound = 0; S.lastPoints = {};
     $('pods').innerHTML = '';
   }
-  $('round-label').textContent = `סיבוב ${st.round}`;
+  $('round-label').textContent = `סיבוב ${st.round}${st.practice ? ' · אימון' : ''}`;
   $('pot-label').textContent = st.pot;
   document.querySelectorAll('.rseg').forEach(seg =>
     seg.classList.toggle('on', +seg.dataset.r <= st.round));
@@ -750,13 +808,13 @@ function renderOver(st) {
       <span class="bal">יתרה: ${row.balance}</span>`;
     table.appendChild(d);
   });
-  if (st.settlement.feeTotal) {
-    const f = document.createElement('div');
-    f.className = 'srow';
-    f.style.cssText = 'justify-content:center;color:var(--dim);font-size:13px';
-    f.textContent = `עמלת בית: ${st.settlement.feeTotal} נק' (${st.fee} לשחקן)`;
-    table.appendChild(f);
-  }
+  const f = document.createElement('div');
+  f.className = 'srow';
+  f.style.cssText = 'justify-content:center;color:var(--dim);font-size:13px';
+  f.textContent = st.practice
+    ? '🎓 משחק אימון — הנקודות לא נספרו'
+    : `עמלת בית: ${st.settlement.feeTotal} נק' (${st.fee} לשחקן)`;
+  table.appendChild(f);
   const oa = $('over-actions');
   oa.innerHTML = '';
   if (amHost(st)) oa.appendChild(btn('משחק חדש 🔄', 'primary', () => action('rematch')));
@@ -765,6 +823,7 @@ function renderOver(st) {
     w.className = 'waitmsg'; w.textContent = 'ממתינים למארח למשחק חדש…';
     oa.appendChild(w);
   }
+  oa.appendChild(btn('🏠 דף הבית', 'ghost', leaveRoom));
 }
 
 async function action(type) {

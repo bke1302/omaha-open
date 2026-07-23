@@ -85,9 +85,18 @@ const waitPhase = async (code, phase, round) => {
   ok(await fails('/api/grant', { token: 'fake', key: 'barak@test.co', amount: 9999 }), 'grant בלי טוקן מנהל — נדחה');
   await post('/api/grant', { token, key: 'barak@test.co', amount: 500 });
 
-  // משחק מלא — שולחן רגיל
+  // עוד 3 שחקנים אמיתיים (משחק עם דמו = אימון בלי נקודות, אז כסף בודקים עם אמיתיים)
+  const p2 = await post('/api/register', { name: 'שני', email: 'shani@test.co', password: 'secret2', invite: 'OMAHA1' });
+  const p3 = await post('/api/register', { name: 'תומר', email: 'tomer@test.co', password: 'secret3', invite: 'OMAHA1' });
+  const p4 = await post('/api/register', { name: 'גיא', email: 'guy@test.co', password: 'secret4', invite: 'OMAHA1' });
+  for (const k of ['shani@test.co', 'tomer@test.co', 'guy@test.co'])
+    await post('/api/grant', { token, key: k, amount: 500 });
+
+  // משחק מלא — שולחן רגיל, 4 שחקנים אמיתיים
   const host = await post('/api/create', { session: login.token, stake: 'low' });
-  await post('/api/action', { code: host.code, pid: host.pid, type: 'fillDemo' });
+  await post('/api/join', { session: p2.token, code: host.code });
+  await post('/api/join', { session: p3.token, code: host.code });
+  await post('/api/join', { session: p4.token, code: host.code });
   await post('/api/action', { code: host.code, pid: host.pid, type: 'start' });
 
   const boardsSeen = [];
@@ -135,10 +144,12 @@ const waitPhase = async (code, phase, round) => {
   const wait2 = await waitPhase(host.code, 'waiting');
   ok(wait2.players.length === 4 && wait2.players.every(p => p.hole.length === 0), 'rematch: חזרה לחדר המתנה נקי');
 
-  // שולחן גבוה — 105
+  // שולחן גבוה — 105, 4 שחקנים אמיתיים
   await post('/api/grant', { token, key: 'barak@test.co', amount: 500 });
   const hi = await post('/api/create', { session: relog.token, stake: 'high' });
-  await post('/api/action', { code: hi.code, pid: hi.pid, type: 'fillDemo' });
+  await post('/api/join', { session: p2.token, code: hi.code });
+  await post('/api/join', { session: p3.token, code: hi.code });
+  await post('/api/join', { session: p4.token, code: hi.code });
   await post('/api/action', { code: hi.code, pid: hi.pid, type: 'start' });
   const hiSt = await waitPhase(hi.code, 'result', 1);
   ok(hiSt.pot === 400, `שולחן גבוה: קופה 400 (${hiSt.pot})`);
@@ -147,6 +158,27 @@ const waitPhase = async (code, phase, round) => {
   ok(hiShare === 100, `שולחן גבוה: סיבוב שווה 100 נק' (${hiShare})`);
   const bank2 = await post('/api/bank', { token });
   ok(bank2.house >= 30, `עמלות: 10 (שולחן רגיל) + 20 (שולחן גבוה) — סה"כ ${bank2.house}`);
+
+  // שולחנות פתוחים + עזיבה + משחק אימון
+  const dana = await post('/api/register', { name: 'דנה', email: 'dana@test.co', password: 'secret7', invite: 'NEWCODE9' });
+  const pr = await post('/api/create', { session: relog.token, stake: 'low' });
+  let lobby = await post('/api/rooms', { session: dana.token });
+  ok(lobby.rooms.some(r => r.code === pr.code && r.count === 1), 'שולחן פתוח מופיע ברשימת הלובי');
+  const dj = await post('/api/join', { session: dana.token, code: pr.code });
+  await post('/api/action', { code: pr.code, pid: dj.pid, type: 'leave' });
+  const afterLeave = await getState(pr.code);
+  ok(afterLeave.players.length === 1, 'עזיבת חדר המתנה משחררת את המקום');
+  await post('/api/action', { code: pr.code, pid: pr.pid, type: 'fillDemo' });
+  const bankBefore = await post('/api/bank', { token });
+  const balBefore = bankBefore.accounts.find(a => a.key === 'barak@test.co').points;
+  await post('/api/action', { code: pr.code, pid: pr.pid, type: 'start' });
+  const pst = await waitPhase(pr.code, 'result', 1);
+  ok(pst.practice === true, 'משחק עם שחקני דמו = משחק אימון');
+  const bankAfter = await post('/api/bank', { token });
+  ok(bankAfter.accounts.find(a => a.key === 'barak@test.co').points === balBefore, 'אימון: היתרה לא השתנתה');
+  ok(bankAfter.house === bankBefore.house, 'אימון: אין עמלת בית');
+  lobby = await post('/api/rooms', { session: dana.token });
+  ok(!lobby.rooms.some(r => r.code === pr.code), 'שולחן שהתחיל יורד מרשימת הלובי');
 
   console.log(failures ? `\n*** ${failures} FAILURES ***` : '\n*** ALL TESTS PASSED ***');
   srv.kill();

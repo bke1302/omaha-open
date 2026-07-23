@@ -172,7 +172,7 @@ function createRoom(stake) {
   const s = STAKES[stake] || STAKES.low;
   const room = {
     code: makeCode(), version: 0, waiters: [], timers: [], game: 0, touched: Date.now(),
-    stake: STAKES[stake] ? stake : 'low', entry: s.entry, fee: s.fee,
+    stake: STAKES[stake] ? stake : 'low', entry: s.entry, fee: s.fee, practice: false,
     phase: 'waiting', round: 0, pot: 0,
     deck: [], board: [], revealed: 0,
     players: [], roundResult: null, results: [], settlement: null,
@@ -201,12 +201,14 @@ function ensureBot(name, need) {
 
 function startGame(room) {
   room.game++;
-  for (const p of room.players) addBal(p.acct, -(room.entry + room.fee));
-  bank.house = Math.round((bank.house + room.fee * room.players.length) * 2) / 2;
-  saveBank();
+  if (!room.practice) {   // משחק אימון (עם דמו) — בלי נקודות ובלי עמלה
+    for (const p of room.players) addBal(p.acct, -(room.entry + room.fee));
+    bank.house = Math.round((bank.house + room.fee * room.players.length) * 2) / 2;
+    saveBank();
+  }
   room.pot = room.entry * room.players.length;
   room.deck = newDeck();
-  for (const p of room.players) { p.hole = room.deck.splice(0, 4); p.wins = 0; p.delta = -(room.entry + room.fee); }
+  for (const p of room.players) { p.hole = room.deck.splice(0, 4); p.wins = 0; p.delta = room.practice ? 0 : -(room.entry + room.fee); }
   room.round = 0; room.results = []; room.settlement = null;
   startRound(room);
 }
@@ -232,7 +234,7 @@ function resolveRound(room) {
   const base = Math.floor(prize / winners.length);
   winners.forEach((w, i) => {
     const share = base + (i < prize - base * winners.length ? 1 : 0);
-    addBal(w.p.acct, share);
+    if (!room.practice) addBal(w.p.acct, share);
     w.p.delta += share;
     w.share = share;
   });
@@ -254,14 +256,16 @@ function finishGame(room) {
     let bonus = 0;
     for (const p of room.players) {
       if (p === sweeper) continue;
-      addBal(p.acct, -room.entry); p.delta -= room.entry; bonus += room.entry;
+      if (!room.practice) addBal(p.acct, -room.entry);
+      p.delta -= room.entry; bonus += room.entry;
     }
-    addBal(sweeper.acct, bonus); sweeper.delta += bonus;
+    if (!room.practice) addBal(sweeper.acct, bonus);
+    sweeper.delta += bonus;
     sweep = { name: sweeper.name, bonus };
   }
   room.settlement = {
     sweep,
-    feeTotal: room.fee * room.players.length,
+    feeTotal: room.practice ? 0 : room.fee * room.players.length,
     rows: room.players
       .map(p => ({ name: p.name, delta: p.delta, balance: getBal(p.acct), wins: p.wins }))
       .sort((a, b) => b.delta - a.delta),
@@ -282,7 +286,7 @@ function publicState(room, pid) {
   return {
     v: room.version, code: room.code, phase: room.phase,
     round: room.round, rounds: ROUNDS, pot: room.pot, entry: room.entry, fee: room.fee,
-    stake: room.stake, seats: SEATS, game: room.game,
+    stake: room.stake, seats: SEATS, game: room.game, practice: room.practice,
     board: room.board.slice(0, room.revealed).map(c => c.id),
     players: room.players.map((p, i) => ({
       seat: i, name: p.name, isBot: p.isBot,
@@ -385,9 +389,22 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* --- חדרים (דורש התחברות) --- */
-    if (u.pathname === '/api/create' || u.pathname === '/api/join') {
+    if (u.pathname === '/api/create' || u.pathname === '/api/join' || u.pathname === '/api/rooms') {
       const s = sessionAcct(body.session);
       if (!s || !s.acct) return json(res, 401, { error: 'צריך להתחבר מחדש' });
+      if (u.pathname === '/api/rooms') {   // שולחנות פתוחים ללובי
+        const open = [];
+        for (const room of rooms.values())
+          if (room.phase === 'waiting' && room.players.length > 0 && room.players.length < SEATS)
+            open.push({
+              code: room.code, stake: room.stake, entry: room.entry, fee: room.fee,
+              count: room.players.length, seats: SEATS,
+              host: room.players[0].name, hasBots: room.players.some(p => p.isBot),
+              t: room.touched,
+            });
+        open.sort((a, b) => b.t - a.t);
+        return json(res, 200, { rooms: open.slice(0, 20).map(({ t, ...r }) => r) });
+      }
       if (u.pathname === '/api/create') {
         const room = createRoom(body.stake);
         const p = addPlayer(room, s.key, s.acct.name);
@@ -485,9 +502,23 @@ const server = http.createServer(async (req, res) => {
       if (t === 'start') {
         if (!isHost || room.phase !== 'waiting') return json(res, 400, { error: 'לא זמין' });
         if (room.players.length !== SEATS) return json(res, 400, { error: `צריך בדיוק ${SEATS} שחקנים` });
-        const poor = room.players.filter(p => getBal(p.acct) < room.entry + room.fee);
-        if (poor.length) return json(res, 400, { error: `אין מספיק נקודות (צריך ${room.entry + room.fee}) ל: ` + poor.map(p => p.name).join(', ') });
+        room.practice = room.players.some(p => p.isBot);   // דמו בשולחן = משחק אימון בלי נקודות
+        if (!room.practice) {
+          const poor = room.players.filter(p => getBal(p.acct) < room.entry + room.fee);
+          if (poor.length) return json(res, 400, { error: `אין מספיק נקודות (צריך ${room.entry + room.fee}) ל: ` + poor.map(p => p.name).join(', ') });
+        }
         startGame(room);
+        return json(res, 200, { ok: 1 });
+      }
+      if (t === 'leave') {
+        if (room.phase === 'waiting' || room.phase === 'over') {
+          room.players = room.players.filter(p => p !== player);
+          if (!room.players.length || room.players.every(p => p.isBot)) {
+            clearTimers(room);
+            bump(room);
+            rooms.delete(room.code);
+          } else bump(room);
+        }
         return json(res, 200, { ok: 1 });
       }
       if (t === 'next') {
