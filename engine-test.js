@@ -123,6 +123,8 @@ const waitPhase = async (code, phase, round) => {
   ok(await fails('/api/login', { email: 'barak@test.co', password: 'secret1' }), 'סיסמה ישנה לא עובדת אחרי איפוס');
   const relog = await post('/api/login', { email: 'barak@test.co', password: 'newpass9' });
   ok(!!relog.token, 'התחברות עם הסיסמה החדשה');
+  const dep = await post('/api/grant', { token, key: 'barak@test.co', amount: 100, fee5: true });
+  ok(dep.credited === 95 && dep.fee === 5, `הפקדה 100 עם עמלה 5% → 95 לשחקן, 5 לבית (${dep.credited}/${dep.fee})`);
   const exp = await post('/api/export', { token });
   ok(exp.data && exp.data.accounts, 'ייצוא גיבוי עובד');
   const imp = await post('/api/import', { token, data: exp.data });

@@ -268,9 +268,9 @@ input.ltr{direction:ltr;text-align:left}
         <input id="rg-name" maxlength="16" placeholder="שם תצוגה (מה שכולם יראו)">
         <input id="rg-email" class="ltr" type="email" placeholder="אימייל" autocomplete="email">
         <input id="rg-pass" class="ltr" type="password" placeholder="סיסמה (6+ תווים)" autocomplete="new-password">
-        <input id="rg-invite" class="ltr" placeholder="קוד הזמנה מהמנהל">
+        <input id="rg-invite" class="ltr" placeholder="קוד הזמנה (מצורף להזמנה שקיבלת)">
         <button class="btn primary" id="btn-reg">הרשמה</button>
-        <div class="hint">ההרשמה בהזמנה בלבד — אין לך קוד? בקש מהמנהל.</div>
+        <div class="hint">ההרשמה בהזמנה בלבד — קוד ההזמנה מגיע ממי שהזמין אותך לשחק (זה לא קוד המנהל).</div>
       </div>
     </div>
   </section>
@@ -857,12 +857,21 @@ async function loadDash() {
         loadDash();
       } catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
     };
+    const deposit = async () => {
+      const v = Number(prompt(`הפקדה ל"${a.name}" — כמה שילם? (5% עמלה יורדת אוטומטית):`));
+      if (!v || v <= 0) return;
+      try {
+        const r = await api('/api/grant', { token: S.adminToken, key: a.key, amount: v, fee5: true });
+        toast(`✓ ${r.name} קיבל ${r.credited} נק' · עמלה לבית: ${r.fee} · יתרה: ${r.balance}`);
+        loadDash();
+      } catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
+    };
     row.append(
+      btn('💰 הפקדה 5%', 'small gold', deposit),
       btn('+50', 'small', () => grant(50)),
-      btn('+200', 'small', () => grant(200)),
       btn('‎-50', 'small', () => grant(-50)),
-      btn('סכום…', 'small gold', () => {
-        const v = Number(prompt(`סכום ל"${a.name}" (שלילי להורדה):`));
+      btn('סכום…', 'small', () => {
+        const v = Number(prompt(`סכום ל"${a.name}" בלי עמלה (שלילי להורדה):`));
         if (v) grant(v);
       }),
     );

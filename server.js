@@ -423,9 +423,17 @@ const server = http.createServer(async (req, res) => {
       }
       if (u.pathname === '/api/grant') {
         const a = bank.accounts[body.key || ''];
-        const amount = Number(body.amount);
+        const amount = Math.round(Number(body.amount) * 2) / 2;
         if (!a || !Number.isFinite(amount) || amount === 0) return json(res, 400, { error: 'חשבון וסכום נדרשים' });
-        addBal(body.key, Math.round(amount * 2) / 2);
+        if (body.fee5 && amount > 0) {
+          // הפקדה עם עמלת בית 5%: השחקן מקבל 95%, הבית מקבל 5%
+          const fee = Math.round(amount * 0.05 * 2) / 2;
+          addBal(body.key, amount - fee);
+          bank.house = Math.round((bank.house + fee) * 2) / 2;
+          saveBank();
+          return json(res, 200, { name: a.name, balance: a.points, credited: amount - fee, fee });
+        }
+        addBal(body.key, amount);
         return json(res, 200, { name: a.name, balance: a.points });
       }
       if (u.pathname === '/api/resetpass') {
