@@ -252,7 +252,7 @@ input.ltr{direction:ltr;text-align:left}
   <section id="scr-auth" class="screen">
     <div class="hero">
       <div class="logo-en">OMAHA OPEN</div>
-      <div class="tagline">אומהה פתוחה · 4 שחקנים · 4 סיבובים · <b>בלי ערבוב</b></div>
+      <div class="tagline"><b>אומהה - פתוחים</b></div>
     </div>
     <div class="glass lobby-box">
       <div class="tabs">
@@ -531,7 +531,7 @@ function enterRoom(code, pid, name) {
 }
 $('btn-copy').onclick = async () => {
   const link = `${location.origin}/?join=${S.code}`;
-  const text = `🃏 בוא לשחק אומהה פתוחה!\nקוד חדר: ${S.code}\n${link}`;
+  const text = `🃏 בוא לשחק אומהה - פתוחים!\nקוד חדר: ${S.code}\n${link}`;
   try { await navigator.clipboard.writeText(text); toast('✓ ההזמנה הועתקה — שלח לחברים'); }
   catch (e) { toast(link); }
 };

@@ -1,7 +1,7 @@
 {
-  "name": "Omaha Open — אומהה פתוחה",
+  "name": "Omaha Open — אומהה פתוחים",
   "short_name": "Omaha Open",
-  "description": "משחק אומהה פתוחה — 4 שחקנים, 4 סיבובים, בלי ערבוב",
+  "description": "אומהה - פתוחים — 4 שחקנים, 4 סיבובים, בלי ערבוב",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
