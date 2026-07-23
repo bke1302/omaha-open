@@ -319,15 +319,16 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   try {
     /* --- קבצים סטטיים (PWA) --- */
-    if (req.method === 'GET' && !u.pathname.startsWith('/api/')) {
+    if ((req.method === 'GET' || req.method === 'HEAD') && !u.pathname.startsWith('/api/')) {
       let rel = u.pathname === '/' ? 'index.html' : decodeURIComponent(u.pathname.slice(1));
       const full = path.join(PUB, path.normalize(rel));
+      const isHead = req.method === 'HEAD';
       if (full.startsWith(PUB) && fs.existsSync(full) && fs.statSync(full).isFile()) {
         res.writeHead(200, { 'Content-Type': MIME[path.extname(full).toLowerCase()] || 'application/octet-stream' });
-        return res.end(fs.readFileSync(full));
+        return res.end(isHead ? undefined : fs.readFileSync(full));
       }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(fs.readFileSync(path.join(PUB, 'index.html')));
+      return res.end(isHead ? undefined : fs.readFileSync(path.join(PUB, 'index.html')));
     }
 
     if (req.method === 'GET' && u.pathname === '/api/state') {
