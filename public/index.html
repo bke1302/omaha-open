@@ -414,10 +414,30 @@ function initial(name) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function esc(s) { return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
+let navLock = false;
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   $(id).classList.add('active');
+  // כפתור "אחורה" של הטלפון עובד בין המסכים
+  if (!navLock && (!history.state || history.state.scr !== id)) {
+    if (history.state === null) history.replaceState({ scr: id }, '');
+    else history.pushState({ scr: id }, '');
+  }
 }
+window.addEventListener('popstate', () => {
+  navLock = true;
+  try {
+    const cur = document.querySelector('.screen.active');
+    const id = cur ? cur.id : '';
+    if (id === 'scr-dash') $('dash-back').click();
+    else if (id === 'scr-room' || id === 'scr-over') leaveRoom();
+    else if (id === 'scr-table') {
+      if (confirm('לצאת לדף הראשי? המשחק ימשיך לרוץ והיד שלך תמשיך לשחק עד הסוף.')) exitToLobby();
+      else history.pushState({ scr: id }, '');
+    }
+    // בלובי או במסך ההתחברות — נשארים (אין לאן לחזור)
+  } finally { navLock = false; }
+});
 function btn(label, cls, fn, disabled) {
   const b = document.createElement('button');
   b.className = 'btn ' + (cls || '');
