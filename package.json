@@ -1,0 +1,11 @@
+{
+  "name": "omaha-open",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omaha Open — open-faced Omaha poker game, private server, virtual points",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node engine-test.js && node shuffle-test.js"
+  },
+  "engines": { "node": ">=18" }
+}

@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: omaha-open
+    runtime: node
+    plan: free
+    buildCommand: "echo no build needed"
+    startCommand: node server.js
+    envVars:
+      - key: ADMIN_PIN
+        sync: false
