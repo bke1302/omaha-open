@@ -12,6 +12,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3777;
 const ADMIN_PIN = process.env.ADMIN_PIN || '1302';   // <<< שנה את הקוד הזה
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // התחברות עם Google (אופציונלי)
 const FAST = !!process.env.FAST;                     // מצב בדיקות מהיר
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const PUB = path.join(__dirname, 'public');
@@ -94,6 +95,43 @@ function safeEq(a, b) {
   const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
   if (ba.length !== bb.length) { crypto.timingSafeEqual(ba, ba); return false; }
   return crypto.timingSafeEqual(ba, bb);
+}
+
+/* ---------- אימות Google ID token (RS256 JWT, בלי ספריות) ---------- */
+// אימות טהור וניתן-לבדיקה: חתימה + aud + iss + exp מול סט מפתחות נתון
+function verifyJwtRS256(token, jwks, opts) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) throw new Error('jwt-format');
+  const [h, p, s] = parts;
+  const header = JSON.parse(Buffer.from(h, 'base64url').toString('utf8'));
+  const jwk = (jwks || []).find(k => k.kid === header.kid && k.kty === 'RSA');
+  if (!jwk) throw new Error('jwt-kid');
+  const pub = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+  const ok = crypto.verify('RSA-SHA256', Buffer.from(h + '.' + p), pub, Buffer.from(s, 'base64url'));
+  if (!ok) throw new Error('jwt-sig');
+  const payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+  const auds = Array.isArray(opts.aud) ? opts.aud : [opts.aud];
+  if (!auds.includes(payload.aud)) throw new Error('jwt-aud');
+  if (opts.iss && !opts.iss.includes(payload.iss)) throw new Error('jwt-iss');
+  if (!payload.exp || payload.exp * 1000 < Date.now()) throw new Error('jwt-exp');
+  return payload;
+}
+let googleKeys = { keys: [], exp: 0 };
+async function getGoogleKeys() {
+  if (Date.now() < googleKeys.exp && googleKeys.keys.length) return googleKeys.keys;
+  const res = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+  const data = await res.json();
+  googleKeys = { keys: data.keys || [], exp: Date.now() + 3600 * 1000 };
+  return googleKeys.keys;
+}
+async function verifyGoogleToken(idToken) {
+  const keys = await getGoogleKeys();
+  const payload = verifyJwtRS256(idToken, keys, {
+    aud: GOOGLE_CLIENT_ID,
+    iss: ['https://accounts.google.com', 'accounts.google.com'],
+  });
+  if (!payload.email || payload.email_verified === false) throw new Error('email');
+  return payload;
 }
 function getBal(key) { const a = bank.accounts[key]; return a ? a.points : 0; }
 function addBal(key, delta) {
@@ -436,9 +474,13 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; " +
-    "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/client; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style; " +
+    "font-src https://fonts.gstatic.com; img-src 'self' data: https://*.googleusercontent.com; " +
+    "connect-src 'self' https://accounts.google.com/gsi/; " +
+    "frame-src https://accounts.google.com/gsi/; " +
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
   try {
     /* --- קבצים סטטיים (PWA) --- */
     if ((req.method === 'GET' || req.method === 'HEAD') && !u.pathname.startsWith('/api/')) {
@@ -475,6 +517,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && u.pathname === '/api/config') {
+      return json(res, 200, { googleClientId: GOOGLE_CLIENT_ID });   // מה זמין ללקוח
+    }
+
     if (req.method !== 'POST') return json(res, 404, { error: 'not found' });
     let body;
     try { body = await readBody(req); }
@@ -483,6 +529,31 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: 'בקשה לא תקינה' });
     }
     const ip = clientIp(req);
+
+    /* --- התחברות עם Google --- */
+    if (u.pathname === '/api/google') {
+      if (!GOOGLE_CLIENT_ID) return json(res, 400, { error: 'התחברות Google לא מוגדרת בשרת' });
+      if (!rateLimit('google:' + ip, 30, 15 * 60 * 1000)) return json(res, 429, { error: 'יותר מדי נסיונות — נסה מאוחר יותר' });
+      let payload;
+      try { payload = await verifyGoogleToken(body.credential); }
+      catch (e) { return json(res, 403, { error: 'אימות Google נכשל' }); }
+      const email = emailKey(payload.email);
+      let acct = bank.accounts[email];
+      if (!acct) {
+        // חשבון חדש דרך Google — עדיין דורש קוד הזמנה
+        const invite = String(body.invite || '').trim();
+        if (!safeEq(invite.toUpperCase(), String(bank.settings.invite).toUpperCase()))
+          return json(res, 403, { error: 'הזדהית עם Google — עכשיו הקלד קוד הזמנה מהמנהל', needInvite: true });
+        if (Object.keys(bank.accounts).length >= MAX_ACCOUNTS) return json(res, 400, { error: 'ההרשמה סגורה' });
+        // שם תצוגה מ-Google, מקוצר וייחודי
+        let base = String(payload.name || payload.email.split('@')[0]).replace(/\s+/g, ' ').trim().slice(0, 16) || 'שחקן';
+        let name = base, n = 2;
+        while (findByName(name)) { name = (base.slice(0, 13) + ' ' + n).slice(0, 16); n++; }
+        acct = bank.accounts[email] = { email, name, google: true, points: 0, bot: false, created: Date.now() };
+        saveBank();
+      }
+      return json(res, 200, { token: newSession(email), name: acct.name, email });
+    }
 
     /* --- הרשמה והתחברות --- */
     if (u.pathname === '/api/register') {
@@ -713,4 +784,4 @@ if (require.main === module) {
           console.log(`ברשת המקומית: http://${ni.address}:${PORT}`);
   });
 }
-module.exports = { evaluate5, bestOmaha, cmpScore, newDeck };
+module.exports = { evaluate5, bestOmaha, cmpScore, newDeck, verifyJwtRS256 };

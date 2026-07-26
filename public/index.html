@@ -306,6 +306,10 @@ input.ltr{direction:ltr;text-align:left}
       <div class="tagline"><b>אומהה - פתוחים</b></div>
     </div>
     <div class="glass lobby-box">
+      <div id="google-slot" style="display:none">
+        <div id="google-btn" style="display:flex;justify-content:center"></div>
+        <div class="divider">או עם אימייל</div>
+      </div>
       <div class="tabs">
         <button id="tab-login" class="active">התחברות</button>
         <button id="tab-reg">הרשמה</button>
@@ -478,6 +482,7 @@ async function api(path, body) {
   if (!res.ok) {
     const err = new Error(data.error || 'שגיאה');
     err.status = res.status;
+    err.data = data;
     throw err;
   }
   return data;
@@ -708,6 +713,47 @@ function doLogout() {
   show('scr-auth');
 }
 $('btn-logout2').onclick = doLogout;
+
+/* ---------- התחברות עם Google ---------- */
+let googleCred = null;
+async function setupGoogle() {
+  let cfg;
+  try { cfg = await (await fetch('/api/config')).json(); } catch (e) { return; }
+  if (!cfg || !cfg.googleClientId) return;
+  await new Promise(resolve => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true; s.defer = true;
+    s.onload = resolve; s.onerror = resolve;
+    document.head.appendChild(s);
+  });
+  if (!window.google || !google.accounts || !google.accounts.id) return;
+  google.accounts.id.initialize({ client_id: cfg.googleClientId, callback: onGoogleCredential });
+  google.accounts.id.renderButton($('google-btn'),
+    { theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', locale: 'he', width: 300 });
+  $('google-slot').style.display = '';
+}
+async function onGoogleCredential(resp) {
+  googleCred = resp.credential;
+  await googleLogin();
+}
+async function googleLogin(invite) {
+  loader(true, 'מתחבר עם Google…');
+  try {
+    const r = await api('/api/google', { credential: googleCred, invite });
+    saveAuth({ token: r.token, name: r.name, email: r.email });
+    loader(false);
+    showLobby();
+  } catch (e) {
+    loader(false);
+    if (e.status === 403 && e.data && e.data.needInvite) {
+      const code = await mAsk({ title: 'קוד הזמנה', sub: 'הזדהית עם Google. הקלד את קוד ההזמנה שקיבלת מהמנהל כדי להצטרף.', input: true, placeholder: 'קוד הזמנה' });
+      if (code) return googleLogin(code);
+    } else {
+      toast(e.message, 1);
+    }
+  }
+}
 
 /* ---------- לובי ---------- */
 document.querySelectorAll('.stake-btn').forEach(b => b.onclick = () => {
@@ -1167,6 +1213,7 @@ function onFirstState() {
 (function init() {
   history.replaceState({ base: 1 }, '');   // בסיס לניווט אחורה
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  setupGoogle();   // מפעיל כפתור Google אם השרת מוגדר
   const qs = new URLSearchParams(location.search);
   if (qs.get('join')) {
     // הזמנה מפורשת גוברת על סשן חדר שמור — מנקים את ה-URL אחרי צריכתו
