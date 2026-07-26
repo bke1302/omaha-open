@@ -3,3 +3,4 @@ data.json.bak
 data.json.tmp
 node_modules/
 *.log
+start-local.ps1
