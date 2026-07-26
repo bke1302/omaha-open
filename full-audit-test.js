@@ -58,8 +58,11 @@ async function reg(name, email, pts, token) {
 
   section('דאשבורד — כל הפעולות');
   const dep = await P('/api/grant', { token, key: 'a@t.co', amount: 100, fee5: true });
-  ok(dep.credited === 95 && dep.fee === 5, 'הפקדה עם עמלה 5% (95 לשחקן, 5 לבית)');
-  await P('/api/grant', { token, key: 'a@t.co', amount: -95 });   // מחזיר לאיזון
+  ok(dep.credited === 100 && dep.fee === 5, 'הפקדה: השחקן מקבל 100 מלא, הבית 5 בנוסף');
+  await P('/api/grant', { token, key: 'a@t.co', amount: -100 });   // מחזיר לאיזון
+  await P('/api/request', { session: A.token, amount: 250 });
+  ok((await P('/api/bank', { token })).requests.some(r => r.key === 'a@t.co' && r.amount === 250), 'בקשת נקודות מופיעה למנהל');
+  await P('/api/denyrequest', { token, key: 'a@t.co' });   // מנקה כדי לא להשפיע על שאר הבדיקה
   await P('/api/resetpass', { token, key: 'a@t.co', password: 'newpass1' });
   ok((await P('/api/login', { email: 'a@t.co', password: 'newpass1' })).token, 'איפוס סיסמה עובד');
   await P('/api/invite', { token, code: 'PARTY7' });

@@ -359,6 +359,7 @@ input.ltr{direction:ltr;text-align:left}
         <div class="bn" id="bal-name"></div>
         <div class="bp" id="bal-pts">— נק'</div>
       </div>
+      <button class="btn small" id="btn-request">בקש נקודות</button>
       <button class="btn ghost small" id="btn-logout2">התנתקות</button>
     </div>
     <div id="low-slot"></div>
@@ -634,14 +635,29 @@ async function refreshMe() {
     const bp = $('bal-pts');
     bp.textContent = `${r.points} נק'`;
     bp.classList.toggle('zero', r.points <= 0);
+    // כפתור הבקשה משתנה ל"ממתין" אם כבר יש בקשה פתוחה
+    const rb = $('btn-request');
+    if (r.pendingRequest) { rb.textContent = `ממתין… (${r.pendingRequest})`; rb.classList.add('ghost'); }
+    else { rb.textContent = 'בקש נקודות'; rb.classList.remove('ghost'); }
     const low = $('low-slot');
     low.innerHTML = r.points < 52.5
-      ? '<div class="lowbanner">אין לך מספיק נקודות למשחק אמיתי — בקש מהמנהל. בינתיים אפשר לשחק אימון מול בוטים 🎓</div>'
+      ? '<div class="lowbanner">אין לך מספיק נקודות למשחק אמיתי. לחץ "בקש נקודות" והמנהל יאשר לך. בינתיים אפשר לשחק אימון מול בוטים 🎓</div>'
       : '';
   } catch (e) {
     if (e.status === 401) needLogin(e.message);
   }
 }
+$('btn-request').onclick = async () => {
+  const a = auth();
+  if (!a) return needLogin('צריך להתחבר');
+  const v = Number(await mAsk({ title: 'בקשת נקודות', sub: 'כמה נקודות אתה מבקש מהמנהל? הוא יאשר ותקבל אותן.', input: true, type: 'number', placeholder: 'למשל 200' }));
+  if (!v || v <= 0) return;
+  try {
+    await api('/api/request', { session: a.token, amount: v });
+    toast('✓ הבקשה נשלחה למנהל — תקבל את הנקודות אחרי אישור');
+    refreshMe();
+  } catch (e) { if (e.status === 401) needLogin(e.message); else toast(e.message, 1); }
+};
 function exitToLobby() {
   S.pollSeq++; S.code = null; S.pid = null; S.state = null; S.v = -1;
   S.shownGame = -1;
@@ -1152,6 +1168,43 @@ async function loadDash() {
     try { await api('/api/invite', { token: S.adminToken, code }); toast('✓ קוד ההזמנה עודכן'); loadDash(); }
     catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
   };
+  // בקשות נקודות ממתינות
+  if (d.requests && d.requests.length) {
+    const reqBox = document.createElement('div');
+    reqBox.className = 'glass settle';
+    reqBox.style.cssText = 'border-color:rgba(255,209,102,.4);margin-bottom:14px';
+    const title = document.createElement('div');
+    title.style.cssText = 'padding:12px 16px;font-weight:900;color:var(--gold);border-bottom:1px solid var(--border)';
+    title.textContent = `🔔 בקשות נקודות ממתינות (${d.requests.length})`;
+    reqBox.appendChild(title);
+    for (const rq of d.requests) {
+      const row = document.createElement('div');
+      row.className = 'drow';
+      const head = document.createElement('div');
+      head.className = 'dhead';
+      head.innerHTML = `<div class="dinfo"><div class="dname">${esc(rq.name)}</div><div class="demail" style="direction:rtl">מבקש ${rq.amount} נק'</div></div>`;
+      const acts = document.createElement('div');
+      acts.className = 'dactions';
+      const approve = async () => {
+        try {
+          const r = await api('/api/grant', { token: S.adminToken, key: rq.key, amount: rq.amount, fee5: true });
+          toast(`✓ ${r.name} קיבל ${r.credited} נק' · עמלת בית: ${r.fee}`);
+          loadDash();
+        } catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
+      };
+      const deny = async () => {
+        try { await api('/api/denyrequest', { token: S.adminToken, key: rq.key }); toast('הבקשה נדחתה'); loadDash(); }
+        catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
+      };
+      acts.append(
+        btn(`✅ אשר ${rq.amount}`, 'small gold', approve),
+        btn('❌ דחה', 'small ghost', deny),
+      );
+      row.append(head, acts);
+      reqBox.appendChild(row);
+    }
+    body.appendChild(reqBox);
+  }
   // רשימת חשבונות
   const list = document.createElement('div');
   list.className = 'glass settle';
@@ -1180,11 +1233,11 @@ async function loadDash() {
       } catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
     };
     const deposit = async () => {
-      const v = Number(await mAsk({ title: `הפקדה ל${a.name}`, sub: 'כמה שילם? 5% עמלת בית יורדת אוטומטית.', input: true, type: 'number', placeholder: 'סכום ששולם' }));
+      const v = Number(await mAsk({ title: `הפקדה ל${a.name}`, sub: 'כמה נקודות לתת (מספר מלא)? השחקן מקבל את הסכום המלא, ו-5% עמלה נזקפת לך בנוסף.', input: true, type: 'number', placeholder: 'למשל 100 / 200 / 500' }));
       if (!v || v <= 0) return;
       try {
         const r = await api('/api/grant', { token: S.adminToken, key: a.key, amount: v, fee5: true });
-        toast(`✓ ${r.name} קיבל ${r.credited} נק' · עמלה לבית: ${r.fee} · יתרה: ${r.balance}`);
+        toast(`✓ ${r.name} קיבל ${r.credited} נק' · עמלת בית לך: ${r.fee} · יתרה: ${r.balance}`);
         loadDash();
       } catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
     };

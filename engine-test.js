@@ -132,8 +132,28 @@ const waitPhase = async (code, phase, round) => {
   ok(await fails('/api/login', { email: 'barak@test.co', password: 'secret1' }), 'סיסמה ישנה לא עובדת אחרי איפוס');
   const relog = await post('/api/login', { email: 'barak@test.co', password: 'newpass9' });
   ok(!!relog.token, 'התחברות עם הסיסמה החדשה');
+  const balPre = (await post('/api/bank', { token })).accounts.find(a => a.key === 'barak@test.co').points;
   const dep = await post('/api/grant', { token, key: 'barak@test.co', amount: 100, fee5: true });
-  ok(dep.credited === 95 && dep.fee === 5, `הפקדה 100 עם עמלה 5% → 95 לשחקן, 5 לבית (${dep.credited}/${dep.fee})`);
+  ok(dep.credited === 100 && dep.fee === 5, `הפקדה 100: השחקן מקבל 100 מלא, הבית 5 בנוסף (${dep.credited}/${dep.fee})`);
+  const balPost = (await post('/api/bank', { token })).accounts.find(a => a.key === 'barak@test.co').points;
+  ok(balPost === balPre + 100, `יתרת השחקן עלתה במספר מלא (${balPre}→${balPost})`);
+  // בקשת נקודות: שחקן מבקש → מופיע אצל המנהל → אישור נותן את הסכום המלא
+  await post('/api/request', { session: relog.token, amount: 300 });
+  const withReq = await post('/api/bank', { token });
+  ok(withReq.requests && withReq.requests.some(r => r.key === 'barak@test.co' && r.amount === 300), 'בקשת נקודות מופיעה בדאשבורד');
+  const meReq = await post('/api/me', { session: relog.token });
+  ok(meReq.pendingRequest === 300, 'השחקן רואה שהבקשה ממתינה (300)');
+  const balB4 = withReq.accounts.find(a => a.key === 'barak@test.co').points;
+  const appr = await post('/api/grant', { token, key: 'barak@test.co', amount: 300, fee5: true });
+  ok(appr.credited === 300, 'אישור בקשה נותן את הסכום המלא (300)');
+  const afterAppr = await post('/api/bank', { token });
+  ok(!afterAppr.requests.some(r => r.key === 'barak@test.co'), 'הבקשה נמחקה אחרי אישור');
+  ok(afterAppr.accounts.find(a => a.key === 'barak@test.co').points === balB4 + 300, 'השחקן קיבל 300 מלא');
+  // דחיית בקשה
+  await post('/api/request', { session: relog.token, amount: 999 });
+  await post('/api/denyrequest', { token, key: 'barak@test.co' });
+  ok(!(await post('/api/bank', { token })).requests.some(r => r.key === 'barak@test.co'), 'דחיית בקשה מסירה אותה בלי לתת נקודות');
+
   const exp = await post('/api/export', { token });
   ok(exp.data && exp.data.accounts, 'ייצוא גיבוי עובד');
   const imp = await post('/api/import', { token, data: exp.data });

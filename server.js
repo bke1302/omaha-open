@@ -51,6 +51,9 @@ function tryLoad(file) {
     if (backup) bank = backup;   // הקובץ הראשי חסר אך יש גיבוי
   }
 }
+if (!bank.settings) bank.settings = { invite: DEFAULT_INVITE };
+if (typeof bank.house !== 'number') bank.house = 0;
+if (!bank.requests) bank.requests = {};   // בקשות נקודות ממתינות (email -> {name, amount, at})
 function writeBankSync() {
   const tmp = DATA_FILE + '.tmp';
   const json = JSON.stringify(bank, null, 2);
@@ -593,10 +596,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* --- חדרים (דורש התחברות) --- */
-    if (u.pathname === '/api/create' || u.pathname === '/api/join' || u.pathname === '/api/rooms' || u.pathname === '/api/me') {
+    if (u.pathname === '/api/create' || u.pathname === '/api/join' || u.pathname === '/api/rooms'
+      || u.pathname === '/api/me' || u.pathname === '/api/request' || u.pathname === '/api/cancelrequest') {
       const s = sessionAcct(body.session);
       if (!s || !s.acct) return json(res, 401, { error: 'צריך להתחבר מחדש' });
-      if (u.pathname === '/api/me') return json(res, 200, { name: s.acct.name, points: s.acct.points, email: s.acct.email });
+      if (u.pathname === '/api/me') {
+        const req = bank.requests[s.key];
+        return json(res, 200, { name: s.acct.name, points: s.acct.points, email: s.acct.email, pendingRequest: req ? req.amount : 0 });
+      }
+      if (u.pathname === '/api/request') {   // שחקן מבקש נקודות מהמנהל
+        if (!rateLimit('req:' + s.key, 5, 60 * 1000)) return json(res, 429, { error: 'רגע — כבר שלחת בקשה' });
+        const amount = Math.round(Number(body.amount));
+        if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) return json(res, 400, { error: 'סכום לא תקין' });
+        bank.requests[s.key] = { name: s.acct.name, amount, at: Date.now() };
+        saveBank();
+        return json(res, 200, { ok: 1, amount });
+      }
+      if (u.pathname === '/api/cancelrequest') {
+        if (bank.requests[s.key]) { delete bank.requests[s.key]; saveBank(); }
+        return json(res, 200, { ok: 1 });
+      }
       if (u.pathname === '/api/rooms') {   // שולחנות פתוחים ללובי
         const open = [];
         for (const room of rooms.values())
@@ -642,28 +661,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { token });
     }
     if (u.pathname === '/api/bank' || u.pathname === '/api/grant' || u.pathname === '/api/resetpass'
-      || u.pathname === '/api/invite' || u.pathname === '/api/export' || u.pathname === '/api/import') {
+      || u.pathname === '/api/invite' || u.pathname === '/api/export' || u.pathname === '/api/import'
+      || u.pathname === '/api/denyrequest') {
       if (!isAdmin(body.token)) return json(res, 403, { error: 'אין הרשאת מנהל' });
 
       if (u.pathname === '/api/bank') {
         const accounts = Object.entries(bank.accounts)
           .map(([key, a]) => ({ key, name: a.name, email: a.email, points: a.points, bot: !!a.bot }))
           .sort((a, b) => (a.bot - b.bot) || b.points - a.points);
-        return json(res, 200, { house: bank.house, invite: bank.settings.invite, accounts });
+        const requests = Object.entries(bank.requests)
+          .map(([key, r]) => ({ key, name: r.name, amount: r.amount, at: r.at }))
+          .sort((a, b) => a.at - b.at);
+        return json(res, 200, { house: bank.house, invite: bank.settings.invite, accounts, requests });
+      }
+      if (u.pathname === '/api/denyrequest') {
+        if (bank.requests[body.key || '']) { delete bank.requests[body.key]; saveBank(); }
+        return json(res, 200, { ok: 1 });
       }
       if (u.pathname === '/api/grant') {
         const a = bank.accounts[body.key || ''];
         const amount = Math.round(Number(body.amount) * 2) / 2;
         if (!a || !Number.isFinite(amount) || amount === 0) return json(res, 400, { error: 'חשבון וסכום נדרשים' });
         if (body.fee5 && amount > 0) {
-          // הפקדה עם עמלת בית 5%: השחקן מקבל 95%, הבית מקבל 5%
+          // הפקדה: השחקן מקבל את הסכום המלא (עגול), והבית מרוויח 5% בנוסף
           const fee = Math.round(amount * 0.05 * 2) / 2;
-          addBal(body.key, amount - fee);
+          addBal(body.key, amount);
           bank.house = Math.round((bank.house + fee) * 2) / 2;
+          if (bank.requests[body.key]) { delete bank.requests[body.key]; }   // מנקה בקשה ממתינה אם יש
           saveBank();
-          return json(res, 200, { name: a.name, balance: a.points, credited: amount - fee, fee });
+          return json(res, 200, { name: a.name, balance: a.points, credited: amount, fee });
         }
         addBal(body.key, amount);
+        if (bank.requests[body.key]) { delete bank.requests[body.key]; saveBank(); }
         return json(res, 200, { name: a.name, balance: a.points });
       }
       if (u.pathname === '/api/resetpass') {
@@ -702,7 +731,7 @@ const server = http.createServer(async (req, res) => {
         }
         const invite = String((d.settings && d.settings.invite) || DEFAULT_INVITE);
         const house = Number(d.house);
-        bank = { accounts: clean, settings: { invite }, house: Number.isFinite(house) && house >= 0 ? house : 0 };
+        bank = { accounts: clean, settings: { invite }, house: Number.isFinite(house) && house >= 0 ? house : 0, requests: {} };
         saveBank();
         return json(res, 200, { ok: 1, count: Object.keys(bank.accounts).length });
       }
