@@ -388,7 +388,7 @@ input.ltr{direction:ltr;text-align:left}
       <h2>חדר המתנה</h2>
       <div class="glass codebox">
         <span class="code-txt" id="room-code">----</span>
-        <button class="btn ghost" id="btn-copy" title="העתק קישור הזמנה">📋 העתק הזמנה</button>
+        <button class="btn ghost" id="btn-copy" title="הזמן חברים">📤 הזמן חברים</button>
       </div>
       <div><span class="stake-badge" id="room-stake"></span></div>
       <div class="copy-hint">שלח לחברים את הקוד או את קישור ההזמנה — צריך בדיוק 4 שחקנים</div>
@@ -728,7 +728,7 @@ $('btn-login').onclick = function () {
     try {
       const r = await api('/api/login', { email: $('li-email').value, password: $('li-pass').value });
       saveAuth({ token: r.token, name: r.name, email: r.email });
-      showLobby();
+      showLobby(); tryAutoJoin();
     } catch (e) { toast(e.message, 1); }
   });
 };
@@ -741,7 +741,7 @@ $('btn-reg').onclick = function () {
       });
       saveAuth({ token: r.token, name: r.name, email: r.email });
       toast('✓ נרשמת! בקש מהמנהל נקודות כדי לשחק');
-      showLobby();
+      showLobby(); tryAutoJoin();
     } catch (e) { toast(e.message, 1); }
   });
 };
@@ -783,7 +783,7 @@ async function googleLogin(invite) {
     const r = await api('/api/google', { credential: googleCred, invite });
     saveAuth({ token: r.token, name: r.name, email: r.email });
     loader(false);
-    showLobby();
+    showLobby(); tryAutoJoin();
   } catch (e) {
     loader(false);
     if (e.status === 403 && e.data && e.data.needInvite) {
@@ -810,6 +810,10 @@ $('btn-create').onclick = function () {
     } catch (e) { if (e.status === 401) needLogin(e.message); else toast(e.message, 1); }
   });
 };
+let pendingJoin = null;
+function tryAutoJoin() {
+  if (pendingJoin && auth()) { const c = pendingJoin; pendingJoin = null; joinRoom(c); }
+}
 async function joinRoom(code) {
   const a = auth();
   if (!a) return needLogin('צריך להתחבר');
@@ -841,7 +845,12 @@ function enterRoom(code, pid, name) {
 $('btn-copy').onclick = async () => {
   const link = `${location.origin}/?join=${S.code}`;
   const text = `🃏 בוא לשחק אומהה - פתוחים!\nקוד חדר: ${S.code}\n${link}`;
-  try { await navigator.clipboard.writeText(text); toast('✓ ההזמנה הועתקה — שלח לחברים'); }
+  // שיתוף מקורי — פותח וואטסאפ/טלגרם/SMS לבחירה, החבר מקבל את הקישור
+  if (navigator.share) {
+    try { await navigator.share({ title: 'הזמנה למשחק אומהה', text }); return; }
+    catch (e) { if (e.name === 'AbortError') return; }
+  }
+  try { await navigator.clipboard.writeText(text); toast('✓ ההזמנה הועתקה — הדבק בוואטסאפ ושלח'); }
   catch (e) { toast(link); }
 };
 
@@ -1278,6 +1287,26 @@ async function loadDash() {
     btn('⬆ שחזור מגיבוי', 'ghost', () => $('import-file').click()),
   );
   body.appendChild(actions);
+  // התראות טלגרם
+  if (d.telegram && d.telegram.available) {
+    const tg = document.createElement('div');
+    tg.className = 'dash-actions';
+    if (d.telegram.connected) {
+      const ok = document.createElement('div');
+      ok.className = 'hint';
+      ok.style.cssText = 'text-align:center;color:var(--win)';
+      ok.textContent = '🔔 התראות טלגרם מחוברות — תקבל הודעה כשמבקשים נקודות.';
+      tg.appendChild(ok);
+    } else {
+      tg.appendChild(btn('🔔 חבר התראות טלגרם', 'primary', async () => {
+        await mAsk({ title: 'חיבור טלגרם', okOnly: true, okLabel: 'עשיתי — המשך',
+          sub: '1) פתח בטלגרם את הבוט שיצרת ולחץ Start / שלח לו הודעה כלשהי.  2) חזור לכאן ולחץ "המשך".' });
+        try { await api('/api/tgconnect', { token: S.adminToken }); toast('✅ טלגרם חובר! שלחתי לך הודעת בדיקה.'); loadDash(); }
+        catch (e) { if (e.status === 403) adminExpired(); else toast(e.message, 1); }
+      }));
+    }
+    body.appendChild(tg);
+  }
   const note = document.createElement('div');
   note.className = 'hint';
   note.style.textAlign = 'center';
@@ -1338,10 +1367,12 @@ function onFirstState() {
   setTimeout(maybeShowInstall, 1500);   // מציע התקנה על מסך הבית
   const qs = new URLSearchParams(location.search);
   if (qs.get('join')) {
-    // הזמנה מפורשת גוברת על סשן חדר שמור — מנקים את ה-URL אחרי צריכתו
-    $('inp-code').value = qs.get('join').toUpperCase().slice(0, 4);
+    // חבר שהגיע מקישור הזמנה — קוד מוכן, ומצטרף אוטומטית אם כבר מחובר
+    const code = qs.get('join').toUpperCase().slice(0, 4);
+    $('inp-code').value = code;
+    pendingJoin = code;
     history.replaceState({ base: 1 }, '', location.pathname);
-    if (auth()) showLobby(); else show('scr-auth');
+    if (auth()) { showLobby(); tryAutoJoin(); } else show('scr-auth');
     return;
   }
   const saved = localStorage.getItem('omaha');

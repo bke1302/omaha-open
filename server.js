@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 3777;
 const ADMIN_PIN = process.env.ADMIN_PIN || '1302';   // <<< שנה את הקוד הזה
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // התחברות עם Google (אופציונלי)
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';   // התראות טלגרם למנהל (אופציונלי)
 const FAST = !!process.env.FAST;                     // מצב בדיקות מהיר
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const PUB = path.join(__dirname, 'public');
@@ -126,6 +127,15 @@ async function getGoogleKeys() {
   const data = await res.json();
   googleKeys = { keys: data.keys || [], exp: Date.now() + 3600 * 1000 };
   return googleKeys.keys;
+}
+/* ---------- התראות טלגרם למנהל ---------- */
+function notifyTelegram(text) {
+  const chatId = bank.settings && bank.settings.telegramChatId;
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  }).catch(e => console.error('telegram send', e.message));
 }
 async function verifyGoogleToken(idToken) {
   const keys = await getGoogleKeys();
@@ -610,6 +620,7 @@ const server = http.createServer(async (req, res) => {
         if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) return json(res, 400, { error: 'סכום לא תקין' });
         bank.requests[s.key] = { name: s.acct.name, amount, at: Date.now() };
         saveBank();
+        notifyTelegram(`🔔 בקשת נקודות\n${s.acct.name} מבקש ${amount} נקודות.\nהיכנס לדאשבורד כדי לאשר.`);
         return json(res, 200, { ok: 1, amount });
       }
       if (u.pathname === '/api/cancelrequest') {
@@ -662,7 +673,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/api/bank' || u.pathname === '/api/grant' || u.pathname === '/api/resetpass'
       || u.pathname === '/api/invite' || u.pathname === '/api/export' || u.pathname === '/api/import'
-      || u.pathname === '/api/denyrequest') {
+      || u.pathname === '/api/denyrequest' || u.pathname === '/api/tgconnect') {
       if (!isAdmin(body.token)) return json(res, 403, { error: 'אין הרשאת מנהל' });
 
       if (u.pathname === '/api/bank') {
@@ -672,7 +683,26 @@ const server = http.createServer(async (req, res) => {
         const requests = Object.entries(bank.requests)
           .map(([key, r]) => ({ key, name: r.name, amount: r.amount, at: r.at }))
           .sort((a, b) => a.at - b.at);
-        return json(res, 200, { house: bank.house, invite: bank.settings.invite, accounts, requests });
+        return json(res, 200, {
+          house: bank.house, invite: bank.settings.invite, accounts, requests,
+          telegram: { available: !!TELEGRAM_BOT_TOKEN, connected: !!bank.settings.telegramChatId },
+        });
+      }
+      if (u.pathname === '/api/tgconnect') {
+        if (!TELEGRAM_BOT_TOKEN) return json(res, 400, { error: 'לא הוגדר בוט טלגרם בשרת (TELEGRAM_BOT_TOKEN)' });
+        try {
+          const upd = await (await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`)).json();
+          const msgs = (upd.result || []).filter(x => x.message && x.message.chat);
+          if (!msgs.length) return json(res, 400, { error: 'שלח קודם הודעה כלשהי לבוט בטלגרם, ואז לחץ שוב' });
+          const chatId = String(msgs[msgs.length - 1].message.chat.id);
+          bank.settings.telegramChatId = chatId;
+          saveBank();
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: '✅ Omaha Open מחובר! מכאן תקבל התראות על בקשות נקודות.' }),
+          });
+          return json(res, 200, { ok: 1 });
+        } catch (e) { return json(res, 500, { error: 'שגיאה בחיבור לטלגרם' }); }
       }
       if (u.pathname === '/api/denyrequest') {
         if (bank.requests[body.key || '']) { delete bank.requests[body.key]; saveBank(); }
