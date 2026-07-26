@@ -97,7 +97,7 @@ const waitPhase = async (code, phase, round) => {
   await post('/api/join', { session: p2.token, code: host.code });
   await post('/api/join', { session: p3.token, code: host.code });
   await post('/api/join', { session: p4.token, code: host.code });
-  await post('/api/action', { code: host.code, pid: host.pid, type: 'start' });
+  await post('/api/action', { code: host.code, pid: host.pid, session: login.token, type: 'start' });
 
   const boardsSeen = [];
   let holesR1 = null;
@@ -111,7 +111,7 @@ const waitPhase = async (code, phase, round) => {
     ok(st.result && st.result.winners.length >= 1, `סיבוב ${round}: יש מנצח (${st.result.handName})`);
     const totalShare = st.result.winners.reduce((s, w) => s + w.share, 0);
     ok(totalShare === 50, `סיבוב ${round}: חולקו בדיוק 50 נק' (${totalShare})`);
-    await post('/api/action', { code: host.code, pid: host.pid, type: 'next' });
+    await post('/api/action', { code: host.code, pid: host.pid, session: login.token, type: 'next' });
   }
   const over = await waitPhase(host.code, 'over');
   const allCards = [...boardsSeen, ...holesR1.flatMap(h => h.split(','))];
@@ -140,9 +140,11 @@ const waitPhase = async (code, phase, round) => {
   ok(imp.count >= 1, 'שחזור מגיבוי עובד');
 
   // rematch
-  await post('/api/action', { code: host.code, pid: host.pid, type: 'rematch' });
+  await post('/api/action', { code: host.code, pid: host.pid, session: login.token, type: 'rematch' });
   const wait2 = await waitPhase(host.code, 'waiting');
   ok(wait2.players.length === 4 && wait2.players.every(p => p.hole.length === 0), 'rematch: חזרה לחדר המתנה נקי');
+  // ברק עוזב כדי לפנות את החדר הפתוח (חשבון יכול לארח חדר-המתנה אחד בלבד)
+  await post('/api/action', { code: host.code, pid: host.pid, session: login.token, type: 'leave' });
 
   // שולחן גבוה — 105, 4 שחקנים אמיתיים
   await post('/api/grant', { token, key: 'barak@test.co', amount: 500 });
@@ -150,7 +152,7 @@ const waitPhase = async (code, phase, round) => {
   await post('/api/join', { session: p2.token, code: hi.code });
   await post('/api/join', { session: p3.token, code: hi.code });
   await post('/api/join', { session: p4.token, code: hi.code });
-  await post('/api/action', { code: hi.code, pid: hi.pid, type: 'start' });
+  await post('/api/action', { code: hi.code, pid: hi.pid, session: relog.token, type: 'start' });
   const hiSt = await waitPhase(hi.code, 'result', 1);
   ok(hiSt.pot === 400, `שולחן גבוה: קופה 400 (${hiSt.pot})`);
   ok(hiSt.entry === 100 && hiSt.fee === 5, `שולחן גבוה: כניסה 100 + עמלה 5`);
@@ -165,13 +167,13 @@ const waitPhase = async (code, phase, round) => {
   let lobby = await post('/api/rooms', { session: dana.token });
   ok(lobby.rooms.some(r => r.code === pr.code && r.count === 1), 'שולחן פתוח מופיע ברשימת הלובי');
   const dj = await post('/api/join', { session: dana.token, code: pr.code });
-  await post('/api/action', { code: pr.code, pid: dj.pid, type: 'leave' });
+  await post('/api/action', { code: pr.code, pid: dj.pid, session: dana.token, type: 'leave' });
   const afterLeave = await getState(pr.code);
   ok(afterLeave.players.length === 1, 'עזיבת חדר המתנה משחררת את המקום');
-  await post('/api/action', { code: pr.code, pid: pr.pid, type: 'fillDemo' });
+  await post('/api/action', { code: pr.code, pid: pr.pid, session: relog.token, type: 'fillDemo' });
   const bankBefore = await post('/api/bank', { token });
   const balBefore = bankBefore.accounts.find(a => a.key === 'barak@test.co').points;
-  await post('/api/action', { code: pr.code, pid: pr.pid, type: 'start' });
+  await post('/api/action', { code: pr.code, pid: pr.pid, session: relog.token, type: 'start' });
   const pst = await waitPhase(pr.code, 'result', 1);
   ok(pst.practice === true, 'משחק עם שחקני דמו = משחק אימון');
   const bankAfter = await post('/api/bank', { token });

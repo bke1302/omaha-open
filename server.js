@@ -23,30 +23,77 @@ const STAKES = {
 const SEATS = 4;           // בדיוק 4 שחקנים
 const ROUNDS = 4;          // 4 סיבובים בלי ערבוב
 const MAX_ACCOUNTS = 200;  // בלם בטיחות
+const MAX_ROOMS = 300;     // תקרת חדרים גלובלית
+const AUTO_ADVANCE_MS = 40000;   // התקדמות סיבוב אוטומטית אם המארח לא לוחץ
 const DEFAULT_INVITE = 'OMAHA1';
 
 /* ---------- בנק וחשבונות (נשמר לקובץ) ---------- */
+const BAK_FILE = DATA_FILE + '.bak';
 let bank = { accounts: {}, settings: { invite: DEFAULT_INVITE }, house: 0 };
-try {
-  const loaded = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  if (loaded && loaded.accounts) bank = loaded;
-} catch (e) { /* קובץ חדש */ }
-let saveTimer = null;
-function saveBank() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.writeFileSync(DATA_FILE, JSON.stringify(bank, null, 2)), 150);
+function tryLoad(file) {
+  try {
+    const loaded = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (loaded && typeof loaded.accounts === 'object') return loaded;
+  } catch (e) {}
+  return null;
 }
-process.on('exit', () => { clearTimeout(saveTimer); try { fs.writeFileSync(DATA_FILE, JSON.stringify(bank, null, 2)); } catch (e) {} });
+{
+  const primary = tryLoad(DATA_FILE);
+  if (primary) bank = primary;
+  else if (fs.existsSync(DATA_FILE)) {
+    // הקובץ קיים אך פגום — אל תמשיך עם בנק ריק! נסה גיבוי, אחרת עצור
+    const backup = tryLoad(BAK_FILE);
+    if (backup) { bank = backup; console.error('data.json פגום — שוחזר מגיבוי'); }
+    else { console.error('data.json פגום ואין גיבוי — עצירה למניעת אובדן נתונים'); process.exit(1); }
+  } else {
+    const backup = tryLoad(BAK_FILE);
+    if (backup) bank = backup;   // הקובץ הראשי חסר אך יש גיבוי
+  }
+}
+function writeBankSync() {
+  const tmp = DATA_FILE + '.tmp';
+  const json = JSON.stringify(bank, null, 2);
+  fs.writeFileSync(tmp, json);          // כתיבה לקובץ זמני
+  try { if (fs.existsSync(DATA_FILE)) fs.copyFileSync(DATA_FILE, BAK_FILE); } catch (e) {}
+  fs.renameSync(tmp, DATA_FILE);        // החלפה אטומית
+}
+let saveTimer = null, saveDirty = false;
+function saveBank() {
+  saveDirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { try { writeBankSync(); saveDirty = false; } catch (e) { console.error('save failed', e); } }, 150);
+}
+function flushBank() {
+  clearTimeout(saveTimer);
+  if (saveDirty) { try { writeBankSync(); saveDirty = false; } catch (e) { console.error('flush failed', e); } }
+}
+function gracefulExit() {
+  try { refundActiveGames(); } catch (e) { console.error('refund failed', e); }
+  flushBank();
+  process.exit(0);
+}
+process.on('exit', flushBank);
+process.on('SIGTERM', gracefulExit);   // Render שולח SIGTERM בכל restart/deploy
+process.on('SIGINT', gracefulExit);
+process.on('uncaughtException', e => { console.error('uncaught', e); flushBank(); });
+process.on('unhandledRejection', e => { console.error('unhandledRejection', e); });
 
 const emailKey = e => String(e || '').trim().toLowerCase();
+// נרמול שם תצוגה נגד התחזות (הומוגליפים/רווחים נסתרים)
+const nameNorm = n => String(n || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 function findByName(name) {
-  const n = String(name || '').trim().toLowerCase();
-  return Object.values(bank.accounts).find(a => a.name.trim().toLowerCase() === n);
+  const n = nameNorm(name);
+  return Object.values(bank.accounts).find(a => nameNorm(a.name) === n);
 }
-function hashPass(pw, salt) { return crypto.scryptSync(String(pw), salt, 64).toString('hex'); }
+// גיבוב סיסמה אסינכרוני — לא חוסם את לולאת האירועים של השרת
+function hashPass(pw, salt) {
+  return new Promise((resolve, reject) =>
+    crypto.scrypt(String(pw), salt, 64, (err, dk) => err ? reject(err) : resolve(dk.toString('hex'))));
+}
 function safeEq(a, b) {
   const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
-  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+  if (ba.length !== bb.length) { crypto.timingSafeEqual(ba, ba); return false; }
+  return crypto.timingSafeEqual(ba, bb);
 }
 function getBal(key) { const a = bank.accounts[key]; return a ? a.points : 0; }
 function addBal(key, delta) {
@@ -54,18 +101,54 @@ function addBal(key, delta) {
   if (a) { a.points = Math.round((a.points + delta) * 2) / 2; saveBank(); }
 }
 
-/* ---------- סשנים ---------- */
-const sessions = new Map();   // token -> accountKey
+/* ---------- מגביל קצב (נגד brute-force ו-DoS) ---------- */
+// ה-IP האמיתי הוא הערך שהפרוקסי הנאמן (Render) מוסיף — הימני ב-XFF, לא השמאלי שהלקוח שולט בו
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (xff.length) return xff[xff.length - 1];
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+const rateBuckets = new Map();   // key -> { count, resetAt }
+function rateLimit(key, max, windowMs) {
+  if (FAST) return true;   // מצב בדיקות — בלי הגבלת קצב
+  const now = Date.now();
+  let b = rateBuckets.get(key);
+  if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + windowMs }; rateBuckets.set(key, b); }
+  b.count++;
+  return b.count <= max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(k);
+}, 60 * 1000).unref();
+
+/* ---------- סשנים (עם תפוגה) ---------- */
+const SESSION_TTL = 30 * 24 * 3600 * 1000;   // 30 יום
+const ADMIN_TTL = 6 * 3600 * 1000;           // 6 שעות
+const sessions = new Map();       // token -> { key, exp }
+const adminTokens = new Map();    // token -> exp
 function newSession(key) {
   const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, key);
+  sessions.set(token, { key, exp: Date.now() + SESSION_TTL });
   return token;
 }
 function sessionAcct(token) {
-  const key = sessions.get(token || '');
-  return key ? { key, acct: bank.accounts[key] } : null;
+  const s = sessions.get(token || '');
+  if (!s) return null;
+  if (Date.now() > s.exp) { sessions.delete(token); return null; }
+  return bank.accounts[s.key] ? { key: s.key, acct: bank.accounts[s.key] } : null;
 }
-const adminTokens = new Set();
+function isAdmin(token) {
+  const exp = adminTokens.get(token || '');
+  if (!exp) return false;
+  if (Date.now() > exp) { adminTokens.delete(token); return false; }
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, s] of sessions) if (now > s.exp) sessions.delete(t);
+  for (const [t, e] of adminTokens) if (now > e) adminTokens.delete(t);
+}, 10 * 60 * 1000).unref();
 
 /* ---------- קלפים ומנוע אומהה ---------- */
 const SUITS = ['S', 'H', 'D', 'C'];
@@ -208,7 +291,7 @@ function startGame(room) {
   }
   room.pot = room.entry * room.players.length;
   room.deck = newDeck();
-  for (const p of room.players) { p.hole = room.deck.splice(0, 4); p.wins = 0; p.delta = room.practice ? 0 : -(room.entry + room.fee); }
+  for (const p of room.players) { p.hole = room.deck.splice(0, 4); p.wins = 0; p.delta = room.practice ? -room.entry : -(room.entry + room.fee); }
   room.round = 0; room.results = []; room.settlement = null;
   startRound(room);
 }
@@ -247,6 +330,14 @@ function resolveRound(room) {
   room.results.push(room.roundResult);
   room.phase = 'result';
   bump(room);
+  // התקדמות אוטומטית — כך שגם אם המארח ננטש/מתנתק, המשחק מסתיים ומשלם לכולם.
+  // לחיצת "next" ידנית של המארח מקדימה את זה (startRound/finishGame מנקים את הטיימר).
+  room.timers.push(setTimeout(() => {
+    try { if (room.phase === 'result') advanceRound(room); } catch (e) { console.error(e); }
+  }, FAST ? 60000 : AUTO_ADVANCE_MS));
+}
+function advanceRound(room) {
+  if (room.round < ROUNDS) startRound(room); else finishGame(room);
 }
 function finishGame(room) {
   clearTimers(room);
@@ -256,8 +347,10 @@ function finishGame(room) {
     let bonus = 0;
     for (const p of room.players) {
       if (p === sweeper) continue;
-      if (!room.practice) addBal(p.acct, -room.entry);
-      p.delta -= room.entry; bonus += room.entry;
+      // רצפת-אפס: לא לוקחים יותר ממה שיש לשחקן — אף אחד לא "גומר את עצמו" למינוס
+      const take = room.practice ? room.entry : Math.min(room.entry, Math.max(0, getBal(p.acct)));
+      if (!room.practice) addBal(p.acct, -take);
+      p.delta -= take; bonus += take;
     }
     if (!room.practice) addBal(sweeper.acct, bonus);
     sweeper.delta += bonus;
@@ -272,6 +365,19 @@ function finishGame(room) {
   };
   room.phase = 'over';
   bump(room);
+}
+// החזר את חלק-הקופה שלא חולק לשחקנים במשחקים שנקטעו (נקרא בכיבוי מסודר)
+function refundActiveGames() {
+  for (const room of rooms.values()) {
+    if (room.practice) continue;
+    if (room.phase !== 'reveal' && room.phase !== 'result') continue;
+    const distributed = room.phase === 'result' ? room.round : room.round - 1;
+    const remaining = ROUNDS - distributed;
+    if (remaining <= 0) continue;
+    const share = (room.pot / ROUNDS) * remaining / room.players.length;
+    for (const p of room.players) addBal(p.acct, share);
+    room.phase = 'over';   // מונע החזר כפול
+  }
 }
 function rematch(room) {
   clearTimers(room);
@@ -307,9 +413,14 @@ function json(res, code, obj) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', c => { data += c; if (data.length > 2e5) req.destroy(); });
-    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
-    req.on('error', reject);
+    let tooBig = false;
+    req.on('data', c => {
+      if (tooBig) return;
+      data += c;
+      if (data.length > 2e5) { tooBig = true; const e = new Error('גוף גדול מדי'); e.tooBig = true; reject(e); req.destroy(); }
+    });
+    req.on('end', () => { if (tooBig) return; try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
+    req.on('error', e => { if (!tooBig) reject(e); });
   });
 }
 const MIME = {
@@ -321,13 +432,21 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; " +
+    "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
   try {
     /* --- קבצים סטטיים (PWA) --- */
     if ((req.method === 'GET' || req.method === 'HEAD') && !u.pathname.startsWith('/api/')) {
       let rel = u.pathname === '/' ? 'index.html' : decodeURIComponent(u.pathname.slice(1));
       const full = path.join(PUB, path.normalize(rel));
       const isHead = req.method === 'HEAD';
-      if (full.startsWith(PUB) && fs.existsSync(full) && fs.statSync(full).isFile()) {
+      const inside = full === PUB || full.startsWith(PUB + path.sep);
+      if (inside && fs.existsSync(full) && fs.statSync(full).isFile()) {
         res.writeHead(200, { 'Content-Type': MIME[path.extname(full).toLowerCase()] || 'application/octet-stream' });
         return res.end(isHead ? undefined : fs.readFileSync(full));
       }
@@ -345,7 +464,7 @@ const server = http.createServer(async (req, res) => {
         send: () => json(res, 200, publicState(room, pid)),
         timer: setTimeout(() => {
           room.waiters = room.waiters.filter(w => w !== waiter);
-          json(res, 200, publicState(room, pid));
+          try { json(res, 200, publicState(room, pid)); } catch (e) { /* לקוח התנתק */ }
         }, 25000),
       };
       room.waiters.push(waiter);
@@ -357,41 +476,56 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method !== 'POST') return json(res, 404, { error: 'not found' });
-    const body = await readBody(req);
+    let body;
+    try { body = await readBody(req); }
+    catch (e) {
+      if (e.tooBig) return json(res, 413, { error: 'בקשה גדולה מדי' });
+      return json(res, 400, { error: 'בקשה לא תקינה' });
+    }
+    const ip = clientIp(req);
 
     /* --- הרשמה והתחברות --- */
     if (u.pathname === '/api/register') {
+      if (!rateLimit('reg:' + ip, 10, 3600 * 1000)) return json(res, 429, { error: 'יותר מדי נסיונות הרשמה — נסה מאוחר יותר' });
       const name = String(body.name || '').trim();
       const email = emailKey(body.email);
       const password = String(body.password || '');
       const invite = String(body.invite || '').trim();
-      if (!EMAIL_RE.test(email)) return json(res, 400, { error: 'כתובת אימייל לא תקינה' });
+      if (!EMAIL_RE.test(email) || email.length > 120) return json(res, 400, { error: 'כתובת אימייל לא תקינה' });
       if (name.length < 2 || name.length > 16 || name.startsWith('__') || name.startsWith('bot:'))
         return json(res, 400, { error: 'שם תצוגה: 2 עד 16 תווים' });
-      if (password.length < 6) return json(res, 400, { error: 'סיסמה: לפחות 6 תווים' });
+      if (password.length < 6 || password.length > 200) return json(res, 400, { error: 'סיסמה: 6 עד 200 תווים' });
       if (!safeEq(invite.toUpperCase(), String(bank.settings.invite).toUpperCase()))
         return json(res, 403, { error: 'קוד הזמנה שגוי — בקש קוד מהמנהל' });
       if (Object.keys(bank.accounts).length >= MAX_ACCOUNTS) return json(res, 400, { error: 'ההרשמה סגורה' });
       if (bank.accounts[email]) return json(res, 400, { error: 'האימייל כבר רשום — התחבר' });
       if (findByName(name)) return json(res, 400, { error: 'שם התצוגה תפוס' });
       const salt = crypto.randomBytes(16).toString('hex');
-      bank.accounts[email] = { email, name, salt, pass: hashPass(password, salt), points: 0, bot: false, created: Date.now() };
+      const pass = await hashPass(password, salt);
+      // בדיקה חוזרת אחרי ה-await (מונע כפילות במרוץ בין שתי הרשמות בו-זמנית)
+      if (bank.accounts[email]) return json(res, 400, { error: 'האימייל כבר רשום — התחבר' });
+      if (findByName(name)) return json(res, 400, { error: 'שם התצוגה תפוס' });
+      bank.accounts[email] = { email, name, salt, pass, points: 0, bot: false, created: Date.now() };
       saveBank();
       return json(res, 200, { token: newSession(email), name, email });
     }
 
     if (u.pathname === '/api/login') {
+      if (!rateLimit('login:' + ip, 20, 15 * 60 * 1000)) return json(res, 429, { error: 'יותר מדי נסיונות כניסה — המתן 15 דקות' });
       const email = emailKey(body.email);
       const acct = bank.accounts[email];
-      if (!acct || acct.bot || !safeEq(hashPass(body.password || '', acct.salt), acct.pass))
+      const salt = acct && !acct.bot ? acct.salt : 'dummysaltdummysalt';
+      const hash = await hashPass(body.password || '', salt);   // תמיד מחשב (מונע דליפת-תזמון)
+      if (!acct || acct.bot || !safeEq(hash, acct.pass))
         return json(res, 403, { error: 'אימייל או סיסמה שגויים' });
       return json(res, 200, { token: newSession(email), name: acct.name, email });
     }
 
     /* --- חדרים (דורש התחברות) --- */
-    if (u.pathname === '/api/create' || u.pathname === '/api/join' || u.pathname === '/api/rooms') {
+    if (u.pathname === '/api/create' || u.pathname === '/api/join' || u.pathname === '/api/rooms' || u.pathname === '/api/me') {
       const s = sessionAcct(body.session);
       if (!s || !s.acct) return json(res, 401, { error: 'צריך להתחבר מחדש' });
+      if (u.pathname === '/api/me') return json(res, 200, { name: s.acct.name, points: s.acct.points, email: s.acct.email });
       if (u.pathname === '/api/rooms') {   // שולחנות פתוחים ללובי
         const open = [];
         for (const room of rooms.values())
@@ -406,6 +540,11 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { rooms: open.slice(0, 20).map(({ t, ...r }) => r) });
       }
       if (u.pathname === '/api/create') {
+        if (rooms.size >= MAX_ROOMS) return json(res, 503, { error: 'השרת עמוס — נסה שוב מאוחר יותר' });
+        // מניעת הצפת חדרים: חשבון יכול לארח חדר פתוח אחד בו-זמנית
+        for (const r of rooms.values())
+          if (r.phase === 'waiting' && r.players[0] && r.players[0].acct === s.key)
+            return json(res, 400, { error: 'כבר יש לך חדר פתוח' });
         const room = createRoom(body.stake);
         const p = addPlayer(room, s.key, s.acct.name);
         bump(room);
@@ -423,14 +562,17 @@ const server = http.createServer(async (req, res) => {
 
     /* --- ניהול --- */
     if (u.pathname === '/api/admin') {
+      // הגנה כפולה: מגבלה לפי IP + מגבלה גלובלית (נגד עקיפה ע"י זיוף IP)
+      if (!rateLimit('admin:' + ip, 5, 15 * 60 * 1000) || !rateLimit('admin:global', 30, 15 * 60 * 1000))
+        return json(res, 429, { error: 'יותר מדי נסיונות — המתן 15 דקות' });
       if (!safeEq(body.pin || '', ADMIN_PIN)) return json(res, 403, { error: 'קוד שגוי' });
-      const token = crypto.randomBytes(16).toString('hex');
-      adminTokens.add(token);
+      const token = crypto.randomBytes(24).toString('hex');
+      adminTokens.set(token, Date.now() + ADMIN_TTL);
       return json(res, 200, { token });
     }
     if (u.pathname === '/api/bank' || u.pathname === '/api/grant' || u.pathname === '/api/resetpass'
       || u.pathname === '/api/invite' || u.pathname === '/api/export' || u.pathname === '/api/import') {
-      if (!adminTokens.has(body.token || '')) return json(res, 403, { error: 'אין הרשאת מנהל' });
+      if (!isAdmin(body.token)) return json(res, 403, { error: 'אין הרשאת מנהל' });
 
       if (u.pathname === '/api/bank') {
         const accounts = Object.entries(bank.accounts)
@@ -457,9 +599,9 @@ const server = http.createServer(async (req, res) => {
         const a = bank.accounts[body.key || ''];
         const password = String(body.password || '');
         if (!a || a.bot) return json(res, 404, { error: 'חשבון לא נמצא' });
-        if (password.length < 6) return json(res, 400, { error: 'סיסמה: לפחות 6 תווים' });
+        if (password.length < 6 || password.length > 200) return json(res, 400, { error: 'סיסמה: 6 עד 200 תווים' });
         a.salt = crypto.randomBytes(16).toString('hex');
-        a.pass = hashPass(password, a.salt);
+        a.pass = await hashPass(password, a.salt);
         saveBank();
         return json(res, 200, { ok: 1, name: a.name });
       }
@@ -473,8 +615,23 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/api/export') return json(res, 200, { data: bank });
       if (u.pathname === '/api/import') {
         const d = body.data;
-        if (!d || typeof d.accounts !== 'object' || !d.settings) return json(res, 400, { error: 'קובץ גיבוי לא תקין' });
-        bank = { accounts: d.accounts, settings: d.settings, house: Number(d.house) || 0 };
+        if (!d || typeof d.accounts !== 'object' || d.accounts === null || !d.settings)
+          return json(res, 400, { error: 'קובץ גיבוי לא תקין' });
+        // ולידציה קשיחה: כל חשבון חייב מבנה תקין ונקודות מספריות סופיות
+        const clean = {};
+        for (const [key, a] of Object.entries(d.accounts)) {
+          if (!a || typeof a !== 'object') return json(res, 400, { error: 'חשבון פגום בגיבוי' });
+          const points = Math.round(Number(a.points) * 2) / 2;   // עיגול לחצי-נקודה
+          if (!Number.isFinite(points)) return json(res, 400, { error: 'יתרה לא תקינה בגיבוי' });
+          if (typeof a.name !== 'string' || !a.name.trim()) return json(res, 400, { error: 'שם חסר בגיבוי' });
+          clean[key] = a.bot
+            ? { email: null, name: a.name, points, bot: true }
+            : { email: a.email || null, name: a.name, salt: String(a.salt || ''), pass: String(a.pass || ''),
+                points, bot: false, created: a.created || Date.now() };
+        }
+        const invite = String((d.settings && d.settings.invite) || DEFAULT_INVITE);
+        const house = Number(d.house);
+        bank = { accounts: clean, settings: { invite }, house: Number.isFinite(house) && house >= 0 ? house : 0 };
         saveBank();
         return json(res, 200, { ok: 1, count: Object.keys(bank.accounts).length });
       }
@@ -486,6 +643,9 @@ const server = http.createServer(async (req, res) => {
       if (!room) return json(res, 404, { error: 'החדר לא נמצא' });
       const player = room.players.find(p => p.id === body.pid);
       if (!player) return json(res, 403, { error: 'שחקן לא מזוהה' });
+      // קשירת סשן: הפעולה חייבת להגיע מהחשבון שיושב במושב הזה
+      const s = sessionAcct(body.session);
+      if (!s || s.key !== player.acct) return json(res, 403, { error: 'צריך להתחבר מחדש' });
       const isHost = room.players[0] === player;
       const t = body.type;
 
@@ -542,6 +702,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (require.main === module) {
+  if (ADMIN_PIN === '1302' && process.env.NODE_ENV === 'production')
+    console.warn('⚠️  אזהרה: ADMIN_PIN הוא ברירת המחדל! הגדר ADMIN_PIN חזק במשתני הסביבה.');
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`OMAHA OPEN רץ על http://localhost:${PORT}`);
     const os = require('os');
